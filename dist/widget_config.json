@@ -1,0 +1,23 @@
+{
+  "x": -1883,
+  "y": 32,
+  "alpha": 0.9,
+  "expanded": false,
+  "refresh": 3.0,
+  "click_through": false,
+  "start_hidden": false,
+  "hotkey_toggle": "ctrl+alt+t",
+  "hotkey_expand": "ctrl+alt+e",
+  "hotkey_lock": "ctrl+alt+l",
+  "hotkey_quit": "ctrl+alt+q",
+  "theme": "OLED",
+  "custom_themes": {},
+  "collapsed": [
+    "G Skill Intl - F5-6000J3636F16G (#0)",
+    "G Skill Intl - F5-6000J3636F16G (#1)",
+    "MSI M470 PRO 1TB",
+    "TEAM T2531TB",
+    "G Skill Intl - F5-6000J3636F16G (#2)",
+    "G Skill Intl - F5-6000J3636F16G (#3)"
+  ]
+}
