@@ -10,6 +10,9 @@ DEFAULTS = {
     "hotkey_toggle": "ctrl+alt+t", "hotkey_expand": "ctrl+alt+e",
     "hotkey_lock": "ctrl+alt+l", "hotkey_quit": "ctrl+alt+q",
     "theme": "Default", "custom_themes": {}, "collapsed": [],
+    "expanded_width": 320, "expanded_height": None, "psu_watts": None,
+    "psu_name": "",
+    "text_scale": 1.15,
 }
 
 
@@ -53,6 +56,29 @@ class Settings:
         theme = self.data.get("theme")
         if theme not in PRESETS and theme not in self.data["custom_themes"]:
             self.data["theme"] = "Default"
+        try:
+            self.data["expanded_width"] = max(
+                280, min(900, int(self.data["expanded_width"])))
+        except (TypeError, ValueError):
+            self.data["expanded_width"] = 320
+        try:
+            height = self.data["expanded_height"]
+            self.data["expanded_height"] = (
+                max(180, min(1400, int(height))) if height is not None else None)
+        except (TypeError, ValueError):
+            self.data["expanded_height"] = None
+        try:
+            self.data["text_scale"] = max(0.9, min(2.0, float(self.data["text_scale"])))
+        except (TypeError, ValueError):
+            self.data["text_scale"] = 1.15
+        try:
+            watts = self.data["psu_watts"]
+            self.data["psu_watts"] = (
+                max(100, min(3000, int(watts))) if watts is not None else None)
+        except (TypeError, ValueError):
+            self.data["psu_watts"] = None
+        name = self.data.get("psu_name")
+        self.data["psu_name"] = " ".join(name.split())[:40] if isinstance(name, str) else ""
 
     def __getitem__(self, key):
         return self.data[key]

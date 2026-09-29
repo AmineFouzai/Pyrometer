@@ -3,19 +3,24 @@ import math
 import os
 import time
 import tkinter as tk
-from tkinter import colorchooser, messagebox
+from tkinter import colorchooser, messagebox, simpledialog
+from tkinter import font as tkfont
 
 from .hotkeys import HotkeyListener
 from .performance import ResourceGovernor
 from .screens import virtual_bounds, work_area_at
-from .sensors import NAMES, SensorReader, primary
+from .sensors import NAMES, SensorReader, estimated_component_power, primary
 from .settings import Settings, resource_dir
 from .themes import PRESETS, ROLES, TRANSPARENT, normalize_hex, resolve_theme
 
 KEY = TRANSPARENT
-PAD, ROW, HEADER, FOOTER = 10, 25, 27, 15
-GROUP_HEADER = 18
-COMPACT_WIDTH, EXPANDED_WIDTH = 208, 286
+# Layout sizes at 100% text size; the widget multiplies them by text_scale.
+PAD, ROW, GAUGE_ROW, HEADER, FOOTER = 10, 25, 30, 27, 15
+GROUP_HEADER, SUMMARY, GAUGE = 18, 44, 22
+CELL_W, CELL_H = 132, 50
+COMPACT_WIDTH = 208
+MIN_EXPANDED_WIDTH, MIN_EXPANDED_HEIGHT = 280, 180
+TEXT_SIZES = (0.9, 1.0, 1.15, 1.3, 1.5, 1.75, 2.0)
 TRIMS_PER_RECLAIM = 10   # redraws between working-set reclaims (~30s)
 ROLE_LABELS = {
     "panel": "Panel", "border": "Border", "text": "Text", "dim": "Muted",
@@ -48,9 +53,14 @@ class Widget:
         self._scroll_track = None
         self._scroll_drag = False
         self._scroll_grab = None
+        self._resize_drag = False
         self._moved = False
         self._last_header_click = 0.0
         self._last_header_name = None
+        self._font_cache = {}
+        self._grid = (1, 1, 1)
+        self._click_applied = False
+        self._apply_scale()
 
         self.reader = SensorReader(self.settings["refresh"])
         if self.reader.open():
@@ -76,7 +86,7 @@ class Widget:
 
         x, y = self.settings["x"], self.settings["y"]
         if x is None or y is None:
-            x, y = self.root.winfo_screenwidth() - COMPACT_WIDTH - 24, 48
+            x, y = self.root.winfo_screenwidth() - self.compact_width - 24, 48
         self.position = [int(x), int(y)]
         self._bind_ui()
         self._build_menu()
@@ -92,6 +102,8 @@ class Widget:
         self.canvas.bind("<ButtonRelease-1>", self._release)
         self.canvas.bind("<Double-Button-1>", self._on_double)
         self.canvas.bind("<MouseWheel>", self._wheel)
+        self.canvas.bind("<Control-MouseWheel>", self._zoom_wheel)
+        self.canvas.bind("<Motion>", self._update_cursor)
         self.canvas.bind("<Button-3>", self._show_menu)
         self.root.bind("<Escape>", lambda _event: self.toggle_visible())
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
@@ -100,7 +112,7 @@ class Widget:
         return dict(tearoff=0, bg=self.colors["panel"], fg=self.colors["text"],
                     activebackground=self.colors["accent"],
                     activeforeground=self.colors["panel"], bd=0,
-                    font=("Segoe UI", 9))
+                    font=self._font("Segoe UI", 9))
 
     def _build_menu(self):
         if getattr(self, "menu", None) is not None:
@@ -119,6 +131,25 @@ class Widget:
             opacity.add_command(label=f"{percent}%",
                                 command=lambda p=percent: self.set_alpha(p / 100))
         self.menu.add_cascade(label="Opacity", menu=opacity)
+        text_size = tk.Menu(self.menu, **style)
+        for scale in TEXT_SIZES:
+            mark = "●  " if abs(scale - self.scale) < 0.01 else "    "
+            text_size.add_command(label=f"{mark}{scale * 100:.0f}%",
+                                  command=lambda s=scale: self.set_text_scale(s))
+        text_size.add_separator()
+        text_size.add_command(label="Ctrl + mouse wheel to adjust", state="disabled")
+        self.menu.add_cascade(label="Text size", menu=text_size)
+        power = tk.Menu(self.menu, **style)
+        watts = self.settings["psu_watts"]
+        psu_name = self.settings["psu_name"]
+        label = (f"{psu_name} · {watts} W" if watts and psu_name
+                 else f"PSU capacity: {watts} W" if watts else "Set PSU capacity…")
+        power.add_command(label=label, command=self._set_psu_capacity)
+        if watts:
+            power.add_command(label="Clear PSU capacity", command=self._clear_psu_capacity)
+        power.add_separator()
+        power.add_command(label="About power estimates", command=self._power_info)
+        self.menu.add_cascade(label="Power", menu=power)
         themes = tk.Menu(self.menu, **style)
         customs = self.settings["custom_themes"]
         for name in PRESETS:
@@ -168,6 +199,51 @@ class Widget:
                 ResourceGovernor.trim()
         self.root.after(200, self._loop)
 
+    def _apply_scale(self):
+        self.scale = self.settings["text_scale"]
+        s = self._s
+        self.pad, self.row, self.gauge_row = s(PAD), s(ROW), s(GAUGE_ROW)
+        self.header, self.footer = s(HEADER), s(FOOTER)
+        self.group_header, self.summary_h = s(GROUP_HEADER), s(SUMMARY)
+        self.gauge = s(GAUGE)
+        self.compact_width = s(COMPACT_WIDTH)
+        self.min_width, self.min_height = s(MIN_EXPANDED_WIDTH), s(MIN_EXPANDED_HEIGHT)
+
+    def _s(self, pixels):
+        return int(round(pixels * self.scale))
+
+    def _font(self, family, size, *styles):
+        return (family, max(6, int(round(size * self.scale))), *styles)
+
+    def _fit(self, text, font, width):
+        """Trim text with an ellipsis so it never runs into the reading."""
+        if self._fit_width(text, font) <= width:
+            return text
+        while text and self._fit_width(text + "…", font) > width:
+            text = text[:-1]
+        return text + "…" if text else ""
+
+    def _expanded_width(self):
+        return max(self.min_width, self.settings["expanded_width"])
+
+    def set_text_scale(self, scale):
+        scale = max(TEXT_SIZES[0], min(TEXT_SIZES[-1], round(scale, 2)))
+        if abs(scale - self.scale) < 0.001:
+            return
+        self.settings["text_scale"] = scale
+        self._apply_scale()
+        self._font_cache.clear()
+        self._persist()
+        self._refresh()
+        self.root.after_idle(self._build_menu)
+
+    def _zoom_wheel(self, event):
+        if not event.delta:
+            return
+        index = min(range(len(TEXT_SIZES)), key=lambda i: abs(TEXT_SIZES[i] - self.scale))
+        index += 1 if event.delta > 0 else -1
+        self.set_text_scale(TEXT_SIZES[max(0, min(len(TEXT_SIZES) - 1, index))])
+
     def _temp_color(self, value):
         if value is None:
             return self.colors["dim"]
@@ -180,62 +256,96 @@ class Widget:
     def _draw(self):
         groups = self.reader.snapshot
         expanded = self.settings["expanded"]
-        width = EXPANDED_WIDTH if expanded else COMPACT_WIDTH
+        width = self._expanded_width() if expanded else self.compact_width
         self._header_hits = []
         self._scroll_track = None
         self._max_scroll = 0
+        chrome = self.header + self.footer + 8
+        saved_height = self.settings["expanded_height"] if expanded else None
         if self.reader.error or not groups:
-            body = ROW * 2
+            body = self.row * 2
         elif expanded:
-            content = self._expanded_content_height(groups)
+            content = self._expanded_content_height(groups, width)
             # The extra 5px is the gap already subtracted from the viewport,
             # so a list that fits does not grow a scrollbar.
             body = min(content + 5, self._max_body())
         else:
-            body = ROW * len(groups)
-        self.size = (width, HEADER + body + FOOTER + 8)
+            body = self.row * self._compact_rows(groups)
+        if saved_height is not None:
+            body = min(self._max_body(), max(self.min_height, saved_height) - chrome)
+        self.size = (width, chrome + body)
         self._place()
 
+        pad = self.pad
         canvas = self.canvas
         canvas.delete("all")
         self._panel(width, self.size[1])
-        canvas.create_text(PAD, 14, text="PYROMETER", anchor="w",
-                           fill=self.colors["accent"], font=("Segoe UI Semibold", 9))
-        hottest = max((s[1] for g in groups for s in g["sensors"] if s[1] is not None),
+        title_y = self.header // 2
+        canvas.create_text(pad, title_y, text="PYROMETER", anchor="w",
+                           fill=self.colors["accent"],
+                           font=self._font("Segoe UI Semibold", 9))
+        hottest = max((s[1] for g in groups for s in g["sensors"]
+                       if s[2] == "Temperature" and s[1] is not None),
                       default=None)
         if hottest is not None:
-            canvas.create_text(width - PAD, 14, text=f"{hottest:.0f}°", anchor="e",
-                               fill=self._temp_color(hottest), font=("Consolas", 11, "bold"))
-        canvas.create_line(PAD, HEADER, width - PAD, HEADER, fill=self.colors["border"])
+            canvas.create_text(width - pad, title_y, text=f"{hottest:.0f}°", anchor="e",
+                               fill=self._temp_color(hottest),
+                               font=self._font("Consolas", 11, "bold"))
+        canvas.create_line(pad, self.header, width - pad, self.header,
+                           fill=self.colors["border"])
 
-        y = HEADER + 8
+        y = self.header + 8
         if self.reader.error:
-            canvas.create_text(PAD, y, text=("⚠ " + self.reader.error)[:42],
-                               anchor="nw", fill=self.colors["hot"], font=("Segoe UI", 8))
+            font = self._font("Segoe UI", 8)
+            canvas.create_text(pad, y, text=self._fit("⚠ " + self.reader.error, font,
+                                                      width - pad * 2),
+                               anchor="nw", fill=self.colors["hot"], font=font)
         elif not groups:
-            canvas.create_text(PAD, y, text="reading sensors…", anchor="nw",
-                               fill=self.colors["dim"], font=("Segoe UI", 9))
+            canvas.create_text(pad, y, text="reading sensors…", anchor="nw",
+                               fill=self.colors["dim"], font=self._font("Segoe UI", 9))
         elif expanded:
             self._expanded(groups, width)
         else:
             self._compact(groups, y, width)
         self._footer(width)
+        if expanded:
+            self._resize_grip(width)
 
     def _max_body(self):
         """Tallest list that still ends inside the monitor work area."""
         _left, top, _width, work_h = work_area_at(*self.position)
         room = top + work_h - self.position[1] - 12
-        chrome = HEADER + FOOTER + 8
-        return max(GROUP_HEADER * 3, min(work_h - chrome - 12, room - chrome))
+        chrome = self.header + self.footer + 8
+        return max(self.group_header * 3, min(work_h - chrome - 12, room - chrome))
 
-    def _expanded_content_height(self, groups):
+    def _grid_layout(self, width, inset):
+        inner = max(1, width - self.pad * 2 - inset)
+        cols = max(1, inner // max(1, self._s(CELL_W)))
+        return cols, inner / cols, self._s(CELL_H)
+
+    def _expanded_content_height(self, groups, width):
         collapsed = set(self.settings["collapsed"])
-        height = 0
-        for group in groups:
-            height += GROUP_HEADER
-            if group["name"] not in collapsed:
-                height += ROW * len(group["sensors"])
+
+        def measure(inset):
+            cols, cell_w, cell_h = self._grid_layout(width, inset)
+            height = self.summary_h
+            for group in groups:
+                height += self.group_header
+                if group["name"] not in collapsed and group["sensors"]:
+                    height += math.ceil(len(group["sensors"]) / cols) * cell_h
+            return height, (cols, cell_w, cell_h)
+
+        height, layout = measure(4)
+        if height + 5 > self._max_body():
+            height, layout = measure(16)
+        self._grid = layout
         return height
+
+    def _compact_rows(self, groups):
+        rows = sum(1 for group in groups if primary(group))
+        if estimated_component_power(groups)[0] is not None or self.settings["psu_watts"]:
+            rows += 1
+        return rows
 
     def _compact(self, groups, y, width):
         disks = 0
@@ -247,51 +357,63 @@ class Widget:
             if label == "DISK":
                 disks += 1
                 label = f"DISK{disks}" if disks > 1 else label
-            self._row(PAD, y, width - PAD * 2, label, sensor, True)
-            y += ROW
+            self._row(self.pad, y, width - self.pad * 2, label, sensor, True)
+            y += self.row
+        estimated, _parts = estimated_component_power(groups)
+        if estimated is not None or self.settings["psu_watts"]:
+            self._power_bar(self.pad, y, width - self.pad * 2, estimated)
         return y
 
     def _expanded(self, groups, width):
-        view_top = HEADER + 8
-        view_bottom = self.size[1] - FOOTER - 5
-        content = self._expanded_content_height(groups)
+        pad = self.pad
+        view_top = self.header + 8
+        view_bottom = self.size[1] - self.footer - 5
+        content = self._expanded_content_height(groups, width)
         visible = max(1, view_bottom - view_top)
         self._max_scroll = max(0, content - visible)
         self.scroll = max(0, min(self.scroll, self._max_scroll))
         collapsed = set(self.settings["collapsed"])
         inset = 16 if self._max_scroll else 4
+        cols, cell_w, cell_h = self._grid
         cursor = view_top - self.scroll
+        if view_top <= cursor and cursor + self.summary_h <= view_bottom:
+            self._power_summary(groups, pad, cursor, width - pad * 2 - inset)
+        cursor += self.summary_h
         for group in groups:
             header_y = cursor
-            cursor += GROUP_HEADER
-            if view_top <= header_y and header_y + GROUP_HEADER <= view_bottom:
+            cursor += self.group_header
+            if view_top <= header_y and header_y + self.group_header <= view_bottom:
                 self._group_header(header_y, width, group, group["name"] in collapsed)
-                self._header_hits.append((header_y, header_y + GROUP_HEADER, group["name"]))
+                self._header_hits.append(
+                    (header_y, header_y + self.group_header, group["name"]))
             if group["name"] in collapsed:
                 continue
-            for sensor in group["sensors"]:
-                row_y = cursor
-                cursor += ROW
-                if view_top <= row_y and row_y + ROW <= view_bottom:
-                    self._row(PAD + 4, row_y, width - PAD * 2 - inset,
-                              sensor[0][:21], sensor)
+            sensors = group["sensors"]
+            for index, sensor in enumerate(sensors):
+                row, col = divmod(index, cols)
+                cell_x = pad + col * cell_w
+                cell_y = cursor + row * cell_h
+                if view_top <= cell_y and cell_y + cell_h <= view_bottom:
+                    self._grid_cell(cell_x, cell_y, cell_w, cell_h, sensor)
+            if sensors:
+                cursor += math.ceil(len(sensors) / cols) * cell_h
         if self._max_scroll:
             self._scrollbar(width, view_top, view_bottom, visible, content)
 
     def _group_header(self, y, width, group, folded):
-        mark = "▶" if folded else "▼"
-        title = group["name"].upper()
-        if folded:
-            title = f"{title[:26]}  {len(group['sensors'])}"
-        else:
-            title = title[:32]
-        self.canvas.create_text(PAD, y + 7, text=mark, anchor="w",
-                                fill=self.colors["dim"], font=("Segoe UI", 7))
-        self.canvas.create_text(PAD + 14, y + 7, text=title, anchor="w",
-                                fill=self.colors["accent"], font=("Segoe UI", 7))
+        pad, mid = self.pad, y + self.group_header // 2 - 1
         gutter = 12 if self._max_scroll else 0
-        self.canvas.create_line(PAD, y + GROUP_HEADER - 2, width - PAD - gutter,
-                                y + GROUP_HEADER - 2, fill=self.colors["border"])
+        font = self._font("Segoe UI Semibold", 7)
+        self.canvas.create_text(pad, mid, text="▶" if folded else "▼", anchor="w",
+                                fill=self.colors["dim"], font=self._font("Segoe UI", 7))
+        count = f"  {len(group['sensors'])}" if folded else ""
+        room = width - pad * 2 - gutter - self._s(14)
+        title = self._fit(group["name"].upper(), font, room - self._s(24)) + count
+        self.canvas.create_text(pad + self._s(14), mid, text=title, anchor="w",
+                                fill=self.colors["accent"], font=font)
+        line_y = y + self.group_header - 2
+        self.canvas.create_line(pad, line_y, width - pad - gutter, line_y,
+                                fill=self.colors["border"])
 
     def _scrollbar(self, width, view_top, view_bottom, visible, content):
         track_h = view_bottom - view_top
@@ -308,19 +430,158 @@ class Widget:
 
     def _row(self, x, y, width, label, sensor, bold=False):
         value = sensor[1]
-        font = ("Segoe UI Semibold", 9) if bold else ("Segoe UI", 8)
-        number = ("Consolas", 10, "bold") if bold else ("Segoe UI", 8)
-        self.canvas.create_text(x, y + 8, text=label, anchor="w",
+        font = self._font("Segoe UI Semibold", 9) if bold else self._font("Segoe UI", 8)
+        number = self._font("Consolas", 10, "bold") if bold else self._font("Segoe UI", 8)
+        text_y, bar_y = y + self._s(8), y + self._s(19)
+        self.canvas.create_text(x, text_y, text=label, anchor="w",
                                 fill=self.colors["text"] if bold else self.colors["dim"],
                                 font=font)
-        self.canvas.create_text(x + width, y + 8,
+        self.canvas.create_text(x + width, text_y,
                                 text="n/a" if value is None else f"{value:.0f}°C",
                                 anchor="e", fill=self._temp_color(value), font=number)
-        self.canvas.create_line(x, y + 19, x + width, y + 19, fill=self.colors["border"])
+        self.canvas.create_line(x, bar_y, x + width, bar_y, fill=self.colors["border"])
         if value is not None:
             end = x + max(2, int(min(value, 100) * width / 100))
-            self.canvas.create_line(x, y + 19, end, y + 19,
+            self.canvas.create_line(x, bar_y, end, bar_y,
                                     fill=self._temp_color(value), width=2)
+
+    def _power_bar(self, x, y, width, estimated):
+        """Compact-mode load bar for the CPU + GPU estimate against PSU capacity."""
+        capacity = self.settings["psu_watts"]
+        font = self._font("Segoe UI Semibold", 9)
+        number = self._font("Consolas", 10, "bold")
+        text_y, bar_y = y + self._s(8), y + self._s(19)
+        if estimated is None:
+            reading, color, ratio = "n/a", self.colors["dim"], 0
+        elif capacity:
+            ratio = estimated / capacity
+            reading = f"{estimated:.0f}W"
+            color = self._power_color(ratio)
+        else:
+            reading, color, ratio = f"{estimated:.0f}W", self.colors["accent"], 0
+        self.canvas.create_text(x, text_y, text="PWR", anchor="w",
+                                fill=self.colors["text"], font=font)
+        self.canvas.create_text(x + width, text_y, text=reading, anchor="e",
+                                fill=color, font=number)
+        self.canvas.create_line(x, bar_y, x + width, bar_y, fill=self.colors["border"])
+        if ratio > 0:
+            end = x + max(2, int(min(ratio, 1) * width))
+            self.canvas.create_line(x, bar_y, end, bar_y, fill=color, width=2)
+
+    def _sensor_meter(self, sensor):
+        name, value, kind = sensor
+        unit = "°C" if kind == "Temperature" else "W"
+        capacity = self.settings["psu_watts"]
+        if kind == "Temperature":
+            maximum = 100.0
+        elif capacity:
+            maximum = float(capacity)
+        else:
+            maximum = max(300.0, math.ceil((value or 0) / 50) * 50.0)
+        ratio = 0.0 if value is None else max(0.0, min(1.0, value / maximum))
+        if value is None:
+            color = self.colors["dim"]
+        elif kind == "Temperature":
+            color = self._temp_color(value)
+        elif capacity:
+            color = self._power_color(ratio)
+        else:
+            color = self.colors["accent"]
+        reading = "n/a" if value is None else f"{value:.0f}{unit}"
+        return name, reading, ratio, color
+
+    def _grid_cell(self, x, y, width, height, sensor):
+        """Card: sensor name above, reading and dial on one line."""
+        name, reading, ratio, color = self._sensor_meter(sensor)
+        gap = self._s(4)
+        self.canvas.create_rectangle(
+            x + gap, y + gap, x + width - gap, y + height - gap,
+            outline=self.colors["border"])
+        name_font = self._font("Segoe UI", 8)
+        value_font = self._font("Consolas", 10, "bold")
+        size = min(self.gauge, height - self._s(18))
+        inner_left = x + self._s(8)
+        inner_right = x + width - self._s(8)
+        dial_x = inner_right - size / 2
+        name_y = y + self._s(14)
+        value_y = y + height - self._s(16)
+        self.canvas.create_text(
+            inner_left, name_y,
+            text=self._fit(name, name_font, width - self._s(16)),
+            anchor="w", fill=self.colors["text"], font=name_font)
+        self.canvas.create_text(
+            dial_x - size / 2 - self._s(4), value_y, text=reading, anchor="e",
+            fill=color, font=value_font)
+        self._dial(dial_x, value_y, size, ratio, color)
+
+    def _fit_width(self, text, font):
+        measure = self._font_cache.get(font)
+        if measure is None:
+            measure = self._font_cache[font] = tkfont.Font(root=self.root, font=font)
+        return measure.measure(text)
+
+    def _dial(self, cx, cy, size, ratio, color):
+        """270° dial that sweeps clockwise from the lower-left, like a speedometer."""
+        radius = size / 2
+        thickness = max(2, self._s(3))
+        inset = thickness / 2
+        box = (cx - radius + inset, cy - radius + inset,
+               cx + radius - inset, cy + radius - inset)
+        self.canvas.create_arc(*box, start=225, extent=-270, style="arc",
+                               outline=self.colors["border"], width=thickness)
+        if ratio > 0:
+            self.canvas.create_arc(*box, start=225, extent=-270 * ratio, style="arc",
+                                   outline=color, width=thickness)
+        angle = math.radians(225 - 270 * ratio)
+        needle = radius - thickness - self._s(2)
+        self.canvas.create_line(cx, cy, cx + needle * math.cos(angle),
+                                cy - needle * math.sin(angle),
+                                fill=color, width=max(1, self._s(1.5)))
+        hub = max(1.5, self._s(2))
+        self.canvas.create_oval(cx - hub, cy - hub, cx + hub, cy + hub,
+                                fill=color, outline="")
+
+    def _power_color(self, ratio):
+        if ratio < 0.70:
+            return self.colors["cold"]
+        if ratio < 0.85:
+            return self.colors["warm"]
+        return self.colors["hot"]
+
+    def _power_summary(self, groups, x, y, width):
+        estimated, _readings = estimated_component_power(groups)
+        capacity = self.settings["psu_watts"]
+        psu_name = self.settings["psu_name"]
+        if estimated is None:
+            title = "POWER TELEMETRY UNAVAILABLE"
+            detail = (f"{psu_name} · {capacity}W · DRAW UNKNOWN" if capacity and psu_name
+                      else f"PSU CAPACITY {capacity}W · DRAW UNKNOWN" if capacity
+                      else "SET PSU CAPACITY FROM RIGHT-CLICK MENU")
+            color = self.colors["dim"]
+        elif capacity:
+            ratio = estimated / capacity
+            status = "NORMAL" if ratio < 0.70 else "ELEVATED" if ratio < 0.85 else "HIGH"
+            title = f"EST. COMPONENT DRAW  {estimated:.0f}W / {capacity}W"
+            headroom = capacity - estimated
+            lead = f"{psu_name} · " if psu_name else ""
+            detail = (f"{lead}{ratio * 100:.0f}% · {status} · "
+                      f"EST. RATING HEADROOM {headroom:.0f}W")
+            color = self._power_color(ratio)
+        else:
+            title = f"EST. COMPONENT DRAW  {estimated:.0f}W"
+            detail = "CPU/GPU ESTIMATE · SET PSU CAPACITY FOR LOAD BAND"
+            color = self.colors["accent"]
+        s, inner = self._s, width - self._s(14)
+        title_font = self._font("Segoe UI Semibold", 8)
+        detail_font = self._font("Segoe UI", 7)
+        self.canvas.create_rectangle(
+            x, y + s(2), x + width, y + self.summary_h - s(5),
+            fill=self.colors["panel"], outline=self.colors["border"])
+        self.canvas.create_text(x + s(7), y + s(14), text=self._fit(title, title_font, inner),
+                                anchor="w", fill=color, font=title_font)
+        self.canvas.create_text(x + s(7), y + s(29),
+                                text=self._fit(detail, detail_font, inner),
+                                anchor="w", fill=self.colors["dim"], font=detail_font)
 
     def _panel(self, width, height):
         radius, points = 9, []
@@ -333,22 +594,43 @@ class Widget:
         self.canvas.create_polygon(points, fill=self.colors["panel"],
                                    outline=self.colors["border"])
 
+    def _grip_box(self):
+        """Opaque corner inside the rounded edge. The outer pixels are transparent."""
+        grip = self._s(26)
+        inset = 10
+        right, bottom = self.size
+        return right - inset - grip, bottom - inset - grip, right - inset, bottom - inset
+
+    def _resize_grip(self, width):
+        x0, y0, x1, y1 = self._grip_box()
+        color = self.colors["accent"]
+        for step in range(3):
+            offset = self._s(4 + step * 5)
+            self.canvas.create_line(x1 - offset, y1 - self._s(3), x1 - self._s(3),
+                                    y1 - offset, fill=color, width=2)
+
     def _footer(self, width):
         if not is_admin():
             note, warn = "no admin — limited sensors", True
         elif self.reader.missing:
             note, warn = "no " + "/".join(self.reader.missing) + " sensors", True
+        elif self.settings["click_through"]:
+            note, warn = "LOCKED · Ctrl+Alt+L to unlock", True
         elif self.settings["expanded"]:
-            note, warn = "click header to fold  ·  wheel to scroll", False
+            note, warn = "drag the corner lines to resize", False
         else:
             note, warn = "Ctrl+Alt+T hide  ·  Ctrl+Alt+E expand", False
-        self.canvas.create_text(PAD, self.size[1] - 8, text=note, anchor="w",
+        font = self._font("Segoe UI", 7)
+        text_y = self.size[1] - self.footer // 2 - 1
+        locked = self.settings["click_through"]
+        room = width - self.pad * 2 - (self._s(50) if locked else self._s(14))
+        self.canvas.create_text(self.pad, text_y, text=self._fit(note, font, room),
+                                anchor="w",
                                 fill=self.colors["warm"] if warn else self.colors["dim"],
-                                font=("Segoe UI", 7))
-        if self.settings["click_through"]:
-            self.canvas.create_text(width - PAD, self.size[1] - 8, text="LOCKED",
-                                    anchor="e", fill=self.colors["warm"],
-                                    font=("Segoe UI", 7))
+                                font=font)
+        if locked:
+            self.canvas.create_text(width - self.pad, text_y, text="LOCKED",
+                                    anchor="e", fill=self.colors["warm"], font=font)
 
     def _place(self):
         """Position against the whole virtual desktop so the widget can sit on
@@ -360,11 +642,20 @@ class Widget:
         self.position[:] = x, y
         self.canvas.config(width=width, height=height)
         self.root.geometry(f"{width}x{height}+{x}+{y}")
+        if not self._click_applied:
+            self._click_applied = True
+            if self.settings["click_through"]:
+                self._apply_click_through(True)
 
     def _drag_start(self, event):
         self.root.focus_set()
         self._press_root = (event.x_root, event.y_root)
         self._moved = False
+        self._resize_drag = self._resize_hit(event)
+        if self._resize_drag:
+            self._resize_origin = (
+                event.x_root, event.y_root, self.size[0], self.size[1])
+            return
         self._scroll_drag = self._scrollbar_hit(event)
         if self._scroll_drag:
             span = self._thumb_span()
@@ -379,6 +670,18 @@ class Widget:
                             event.y_root - self.position[1])
 
     def _drag(self, event):
+        if self._resize_drag:
+            start_x, start_y, start_w, start_h = self._resize_origin
+            _left, top, work_w, work_h = work_area_at(*self.position)
+            max_h = max(self.min_height, top + work_h - self.position[1] - 8)
+            self.settings["expanded_width"] = max(
+                self.min_width,
+                min(work_w - 8, start_w + event.x_root - start_x))
+            self.settings["expanded_height"] = max(
+                self.min_height,
+                min(max_h, start_h + event.y_root - start_y))
+            self._refresh()
+            return
         if self._scroll_drag:
             if self._scroll_grab is None:
                 self._jump_scroll(event.y)
@@ -397,6 +700,10 @@ class Widget:
         self._place()
 
     def _release(self, event):
+        if self._resize_drag:
+            self._resize_drag = False
+            self._persist()
+            return
         if self._scroll_drag:
             self._scroll_drag = False
             return
@@ -417,14 +724,14 @@ class Widget:
         # also collapse the whole panel, even if the list jumps under the cursor.
         if time.monotonic() - self._last_header_click < 0.45:
             return
-        if self._header_at(event.x, event.y) and event.y > HEADER:
+        if self._header_at(event.x, event.y) and event.y > self.header:
             return
         self.toggle_expanded()
 
     def _wheel(self, event):
         if not self.settings["expanded"] or self._max_scroll <= 0 or not event.delta:
             return
-        step = ROW if event.delta < 0 else -ROW
+        step = self.gauge_row if event.delta < 0 else -self.gauge_row
         self.scroll = max(0, min(self._max_scroll, self.scroll + step))
         self._refresh()
 
@@ -434,6 +741,15 @@ class Widget:
             return False
         x0, top, bottom, _thumb_h = track
         return event.x >= x0 and top <= event.y <= bottom
+
+    def _resize_hit(self, event):
+        if not self.settings["expanded"] or self.size[0] <= 0:
+            return False
+        x0, y0, x1, y1 = self._grip_box()
+        return x0 <= event.x <= x1 and y0 <= event.y <= y1
+
+    def _update_cursor(self, event):
+        self.canvas.configure(cursor="size_nw_se" if self._resize_hit(event) else "")
 
     def _jump_scroll(self, y):
         track = self._scroll_track
@@ -496,14 +812,71 @@ class Widget:
         self.settings["alpha"] = value
         self.root.attributes("-alpha", value)
 
+    def _set_psu_capacity(self):
+        current = self.settings["psu_watts"] or 650
+        self.root.attributes("-topmost", False)
+        try:
+            watts = simpledialog.askinteger(
+                "PSU capacity",
+                "Enter the rated wattage printed on the PSU label.\n"
+                "This cannot be detected reliably by software:",
+                parent=self.root, initialvalue=current, minvalue=100, maxvalue=3000)
+        finally:
+            self.root.attributes("-topmost", True)
+            self.root.lift()
+        if watts is None:
+            return
+        if watts != self.settings["psu_watts"]:
+            self.settings["psu_name"] = ""
+        self.settings["psu_watts"] = watts
+        self._persist()
+        self._refresh()
+        self.root.after_idle(self._build_menu)
+
+    def _clear_psu_capacity(self):
+        self.settings["psu_watts"] = None
+        self.settings["psu_name"] = ""
+        self._persist()
+        self._refresh()
+        self.root.after_idle(self._build_menu)
+
+    def _power_info(self):
+        self.root.attributes("-topmost", False)
+        try:
+            messagebox.showinfo(
+                "Power estimates",
+                "Pyrometer can show power sensors reported by the CPU, GPU, "
+                "motherboard, and other hardware.\n\n"
+                "The summary adds one CPU package reading and one GPU board "
+                "reading when available. It is not total wall power and may "
+                "exclude the motherboard, drives, fans, conversion losses, "
+                "and unsupported devices.\n\n"
+                "A normal desktop PSU does not report its rated capacity. "
+                "Enter the wattage printed on its physical label. For accurate "
+                "whole-system draw, use a plug-in wall power meter.",
+                parent=self.root)
+        finally:
+            self.root.attributes("-topmost", True)
+            self.root.lift()
+
     def toggle_click_through(self):
         enabled = not self.settings["click_through"]
-        hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
-        style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
-        ctypes.windll.user32.SetWindowLongW(
-            hwnd, -20, (style | 0x00080020) if enabled else (style & ~0x20))
+        self._apply_click_through(enabled)
         self.settings["click_through"] = enabled
         self.dirty = True
+
+    def _apply_click_through(self, enabled):
+        """64-bit Windows ignores the 32-bit style call, which left the lock stuck."""
+        user32 = ctypes.windll.user32
+        user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+        user32.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+        user32.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_ssize_t]
+        hwnd = user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+        style = user32.GetWindowLongPtrW(hwnd, -20)
+        style = (style | 0x00080020) if enabled else (style & ~0x20)
+        user32.SetWindowLongPtrW(hwnd, -20, style)
+        user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, 0x0027)
 
     def _theme_label(self, name):
         return ("●  " if name == self.settings["theme"] else "    ") + name

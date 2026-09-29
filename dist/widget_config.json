@@ -1,8 +1,8 @@
 {
-  "x": -1883,
-  "y": 32,
+  "x": -1917,
+  "y": 4,
   "alpha": 0.9,
-  "expanded": false,
+  "expanded": true,
   "refresh": 3.0,
   "click_through": false,
   "start_hidden": false,
@@ -15,9 +15,14 @@
   "collapsed": [
     "G Skill Intl - F5-6000J3636F16G (#0)",
     "G Skill Intl - F5-6000J3636F16G (#1)",
-    "MSI M470 PRO 1TB",
-    "TEAM T2531TB",
     "G Skill Intl - F5-6000J3636F16G (#2)",
-    "G Skill Intl - F5-6000J3636F16G (#3)"
-  ]
+    "G Skill Intl - F5-6000J3636F16G (#3)",
+    "MSI M470 PRO 1TB",
+    "TEAM T2531TB"
+  ],
+  "expanded_width": 799,
+  "expanded_height": 840,
+  "psu_watts": 850,
+  "psu_name": "MSI MPG A850G",
+  "text_scale": 1.15
 }

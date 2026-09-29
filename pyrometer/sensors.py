@@ -17,12 +17,21 @@ HINTS = {
     "GpuNvidia": ("gpu core",), "GpuAmd": ("gpu core", "gpu edge"),
     "GpuIntel": ("gpu core",), "Storage": ("temperature",),
 }
+POWER_HINTS = {
+    "Cpu": ("cpu package", "package power"),
+    "GpuNvidia": ("gpu board power", "gpu power", "total board power"),
+    "GpuAmd": ("gpu total", "gpu power", "total board power"),
+    "GpuIntel": ("gpu package", "gpu power"),
+}
 
 
 def primary(group):
-    available = [sensor for sensor in group["sensors"] if sensor[1] is not None]
+    available = [sensor for sensor in group["sensors"]
+                 if sensor[2] == "Temperature" and sensor[1] is not None]
     if not available:
-        return group["sensors"][0] if group["sensors"] else None
+        temperatures = [sensor for sensor in group["sensors"]
+                        if sensor[2] == "Temperature"]
+        return temperatures[0] if temperatures else None
     hints = HINTS.get(group["type"], ())
     for exact in (True, False):
         for hint in hints:
@@ -31,6 +40,37 @@ def primary(group):
                 if (name == hint) if exact else (hint in name):
                     return sensor
     return max(available, key=lambda sensor: sensor[1])
+
+
+def primary_power(group):
+    """Pick one non-overlapping-ish CPU/GPU package reading for an estimate."""
+    available = [sensor for sensor in group["sensors"]
+                 if sensor[2] == "Power" and sensor[1] is not None]
+    if not available:
+        return None
+    hints = POWER_HINTS.get(group["type"], ())
+    for exact in (True, False):
+        for hint in hints:
+            for sensor in available:
+                name = sensor[0].lower()
+                if (name == hint) if exact else (hint in name):
+                    return sensor
+    # Do not invent a whole-device total from core/rail readings.
+    return None
+
+
+def estimated_component_power(groups):
+    """CPU package + GPU board estimates; intentionally excludes unknown rails."""
+    readings = []
+    for group in groups:
+        if group["type"] not in POWER_HINTS:
+            continue
+        sensor = primary_power(group)
+        if sensor:
+            readings.append((group["name"], sensor))
+    if not readings:
+        return None, ()
+    return sum(sensor[1] for _name, sensor in readings), tuple(readings)
 
 
 class SensorReader(threading.Thread):
@@ -155,13 +195,14 @@ class SensorReader(threading.Thread):
 
     def _scan(self, hardware, found):
         for sensor in hardware.Sensors:
-            if str(sensor.SensorType) != "Temperature":
+            kind = str(sensor.SensorType)
+            if kind not in ("Temperature", "Power"):
                 continue
             name = str(sensor.Name)
-            if any(item in name for item in SKIP):
+            if kind == "Temperature" and any(item in name for item in SKIP):
                 continue
             value = sensor.Value
-            found.append((name, float(value) if value is not None else None))
+            found.append((name, float(value) if value is not None else None, kind))
         for child in hardware.SubHardware:
             self._scan(child, found)
 

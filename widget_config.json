@@ -9,5 +9,7 @@
     "hotkey_toggle":  "ctrl+alt+t",
     "hotkey_expand":  "ctrl+alt+e",
     "hotkey_lock":  "ctrl+alt+l",
-    "hotkey_quit":  "ctrl+alt+q"
+    "hotkey_quit":  "ctrl+alt+q",
+    "psu_watts":  850,
+    "psu_name":  "MSI MPG A850G"
 }
